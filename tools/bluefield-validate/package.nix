@@ -1,4 +1,4 @@
-{ lib, rustPlatform, makeWrapper, gnutar }:
+{ lib, rustPlatform }:
 
 rustPlatform.buildRustPackage {
   pname = "bluefield-validate";
@@ -6,13 +6,6 @@ rustPlatform.buildRustPackage {
 
   src = ./.;
   cargoLock.lockFile = ./Cargo.lock;
-
-  nativeBuildInputs = [ makeWrapper ];
-
-  postInstall = ''
-    wrapProgram "$out/bin/bluefield-validate" \
-      --prefix PATH : ${lib.makeBinPath [ gnutar ]}
-  '';
 
   meta = {
     description = "Validation helpers for NVIDIA BlueField NixOS installs";

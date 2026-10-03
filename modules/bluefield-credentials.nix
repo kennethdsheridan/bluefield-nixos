@@ -36,6 +36,15 @@ in
       description = "Extra Nix trusted-users entries for the BlueField DPU.";
     };
 
+    passwordlessSudo = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Allow the configured administrator user to use sudo without a password.
+        This is an explicit break-glass option for key-only installs.
+      '';
+    };
+
     requireKeys = lib.mkOption {
       type = lib.types.bool;
       default = false;

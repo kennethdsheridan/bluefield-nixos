@@ -5,3 +5,5 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+tar = "0.4"
+xz2 = "0.1"

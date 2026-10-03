@@ -43,6 +43,12 @@ nix flake check
 nix build .#bluefield-validate
 ```
 
+`bluefield-validate check-kexec-tarball` is a metadata safety check, not an
+authenticity check. Run it only on locally built or otherwise trusted tarballs.
+It requires nixos-anywhere kexec tarballs to contain only safe relative
+regular-file and directory entries, owned by `0:0`, without writable group/world
+bits or special mode bits.
+
 ## Credential Model
 
 Bootstrap SSH public keys identify an operator. Keep them out of the public repo
@@ -53,6 +59,7 @@ bluefield.credentials = {
   requireKeys = true;
   adminUser = "admin";
   authorizedKeys = [ "ssh-ed25519 <operator-public-key>" ];
+  rootAuthorizedKeys = [ "ssh-ed25519 <operator-public-key>" ];
   trustedUsers = [ "admin" ];
 };
 ```

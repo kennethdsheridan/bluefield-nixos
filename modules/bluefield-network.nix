@@ -29,6 +29,12 @@ in
         default = "192.168.100.1";
         description = "Host-side tmfifo peer address.";
       };
+
+      defaultRoute = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Use the host-side tmfifo peer as the default gateway.";
+      };
     };
 
     oob = {
@@ -56,16 +62,18 @@ in
     (lib.mkIf (cfg.tmfifo.enable || cfg.oob.enable) {
       networking.useDHCP = false;
       networking.useNetworkd = true;
-      networking.firewall.allowedTCPPorts = [ 22 ];
     })
 
     (lib.mkIf cfg.tmfifo.enable {
+      networking.firewall.interfaces.${cfg.tmfifo.interfaceName}.allowedTCPPorts = [ 22 ];
+
       systemd.network.networks."10-bluefield-tmfifo" = {
         matchConfig.Name = cfg.tmfifo.interfaceName;
         networkConfig = {
           Address = cfg.tmfifo.address;
-          Gateway = cfg.tmfifo.peerAddress;
           IPv6AcceptRA = false;
+        } // lib.optionalAttrs cfg.tmfifo.defaultRoute {
+          Gateway = cfg.tmfifo.peerAddress;
         };
       };
 
@@ -112,6 +120,8 @@ in
     })
 
     (lib.mkIf (cfg.oob.enable && cfg.oob.dhcp) {
+      networking.firewall.interfaces.${cfg.oob.interfaceName}.allowedTCPPorts = [ 22 ];
+
       systemd.network.networks."20-bluefield-oob" = {
         matchConfig.Name = cfg.oob.interfaceName;
         networkConfig.DHCP = "ipv4";

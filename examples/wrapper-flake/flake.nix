@@ -19,7 +19,9 @@
             requireKeys = true;
             adminUser = "admin";
             authorizedKeys = [ "ssh-ed25519 <operator-public-key>" ];
+            rootAuthorizedKeys = [ "ssh-ed25519 <operator-public-key>" ];
             trustedUsers = [ "admin" ];
+            passwordlessSudo = false;
           };
         }
       ];

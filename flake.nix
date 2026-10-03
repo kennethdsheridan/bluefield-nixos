@@ -28,9 +28,120 @@
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate;
       });
 
-      checks = forAllSystems (pkgs: {
-        bluefield-validate = self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate;
-      });
+      checks = forAllSystems (pkgs:
+        let
+          dummyKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakePublicKeyForEvaluationOnly000000000000 bluefield-nixos-check";
+          dpuSystem = lib.nixosSystem {
+            system = "aarch64-linux";
+            modules = [
+              self.nixosModules.bluefield-dpu
+              {
+                system.stateVersion = "25.11";
+                fileSystems."/" = {
+                  device = "/dev/disk/by-label/nixos";
+                  fsType = "ext4";
+                };
+                fileSystems."/boot/efi" = {
+                  device = "/dev/disk/by-label/ESP";
+                  fsType = "vfat";
+                };
+                bluefield.credentials.rootAuthorizedKeys = [ dummyKey ];
+              }
+            ];
+          };
+          kexecSystem = lib.nixosSystem {
+            system = "aarch64-linux";
+            modules = [
+              self.nixosModules.bluefield-kexec-installer
+              {
+                bluefield.credentials.rootAuthorizedKeys = [ dummyKey ];
+              }
+            ];
+          };
+        in
+        {
+          bluefield-validate = self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate;
+
+          bluefield-module-eval = pkgs.runCommand "bluefield-module-eval" { } ''
+            cat > "$out" <<'EOF'
+            ${builtins.unsafeDiscardStringContext dpuSystem.config.system.build.toplevel.drvPath}
+            ${builtins.unsafeDiscardStringContext kexecSystem.config.system.build.toplevel.drvPath}
+            EOF
+          '';
+
+          bluefield-validate-kexec-tarball = pkgs.runCommand "bluefield-validate-kexec-tarball"
+            {
+              nativeBuildInputs = [
+                self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate
+                pkgs.coreutils
+                pkgs.gnutar
+                pkgs.xz
+              ];
+            } ''
+            mkdir -p good/kexec bad-link/kexec bad-traversal/kexec bad-owner/kexec bad-mode/kexec bad-space/kexec bad-dot/kexec
+
+            printf '#!/bin/sh\n' > good/kexec/run
+            chmod 0755 good/kexec/run
+            touch good/kexec/bzImage good/kexec/initrd.gz
+            tar --owner=0 --group=0 --numeric-owner -C good -cJf good.tar.xz kexec
+            bluefield-validate check-kexec-tarball good.tar.xz
+
+            ln -s /bin/sh bad-link/kexec/run
+            touch bad-link/kexec/bzImage bad-link/kexec/initrd.gz
+            tar --owner=0 --group=0 --numeric-owner -C bad-link -cJf bad-link.tar.xz kexec
+            if bluefield-validate check-kexec-tarball bad-link.tar.xz; then
+              echo "validator accepted symlinked kexec/run" >&2
+              exit 1
+            fi
+
+            printf '#!/bin/sh\n' > bad-traversal/kexec/run
+            chmod 0755 bad-traversal/kexec/run
+            touch bad-traversal/kexec/bzImage bad-traversal/kexec/initrd.gz
+            tar --owner=0 --group=0 --numeric-owner --transform='s#^kexec/run$#../kexec/run#' -C bad-traversal -cJf bad-traversal.tar.xz kexec
+            if bluefield-validate check-kexec-tarball bad-traversal.tar.xz; then
+              echo "validator accepted path traversal" >&2
+              exit 1
+            fi
+
+            printf '#!/bin/sh\n' > bad-owner/kexec/run
+            chmod 0755 bad-owner/kexec/run
+            touch bad-owner/kexec/bzImage bad-owner/kexec/initrd.gz
+            tar --owner=123 --group=456 --numeric-owner -C bad-owner -cJf bad-owner.tar.xz kexec
+            if bluefield-validate check-kexec-tarball bad-owner.tar.xz; then
+              echo "validator accepted non-root ownership" >&2
+              exit 1
+            fi
+
+            printf '#!/bin/sh\n' > bad-mode/kexec/run
+            chmod 0755 bad-mode/kexec/run
+            touch bad-mode/kexec/bzImage bad-mode/kexec/initrd.gz
+            tar --owner=0 --group=0 --numeric-owner --mode=4755 -C bad-mode -cJf bad-mode.tar.xz kexec
+            if bluefield-validate check-kexec-tarball bad-mode.tar.xz; then
+              echo "validator accepted setuid mode" >&2
+              exit 1
+            fi
+
+            printf '#!/bin/sh\n' > 'bad-space/kexec/run extra'
+            chmod 0755 'bad-space/kexec/run extra'
+            touch bad-space/kexec/bzImage bad-space/kexec/initrd.gz
+            tar --owner=0 --group=0 --numeric-owner -C bad-space -cJf bad-space.tar.xz kexec
+            if bluefield-validate check-kexec-tarball bad-space.tar.xz; then
+              echo "validator accepted ambiguous spaced path as kexec/run" >&2
+              exit 1
+            fi
+
+            printf '#!/bin/sh\n' > bad-dot/kexec/run
+            chmod 0755 bad-dot/kexec/run
+            touch bad-dot/kexec/bzImage bad-dot/kexec/initrd.gz
+            tar --owner=0 --group=0 --numeric-owner --transform='s#^kexec/run$#./kexec/run#' -C bad-dot -cJf bad-dot.tar.xz kexec
+            if bluefield-validate check-kexec-tarball bad-dot.tar.xz; then
+              echo "validator accepted dot-prefixed path alias" >&2
+              exit 1
+            fi
+
+            touch "$out"
+          '';
+        });
 
       formatter = forAllSystems (pkgs: pkgs.nixpkgs-fmt);
 

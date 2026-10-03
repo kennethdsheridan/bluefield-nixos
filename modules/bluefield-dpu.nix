@@ -46,6 +46,20 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !credentials.requireKeys
+          || credentials.rootAuthorizedKeys != [ ]
+          || credentials.adminUser == "root"
+          || credentials.passwordlessSudo;
+        message = ''
+          BlueField DPU key-only admin access needs a privileged recovery path.
+          Set bluefield.credentials.rootAuthorizedKeys, use adminUser = "root",
+          or explicitly enable bluefield.credentials.passwordlessSudo.
+        '';
+      }
+    ];
+
     nixpkgs.hostPlatform = lib.mkDefault "aarch64-linux";
 
     boot = {
@@ -166,7 +180,8 @@ in
     };
 
     users.users = {
-      root.openssh.authorizedKeys.keys = credentials.rootAuthorizedKeys;
+      root.openssh.authorizedKeys.keys = credentials.rootAuthorizedKeys
+        ++ lib.optionals (credentials.adminUser == "root") credentials.authorizedKeys;
     } // lib.optionalAttrs (credentials.adminUser != "root") {
       ${credentials.adminUser} = {
         isNormalUser = true;
@@ -178,7 +193,7 @@ in
     };
 
     nix.settings.trusted-users = [ "root" ] ++ credentials.trustedUsers;
-    security.sudo.wheelNeedsPassword = lib.mkDefault true;
+    security.sudo.wheelNeedsPassword = lib.mkDefault (!credentials.passwordlessSudo);
 
     services.openssh = {
       enable = true;
