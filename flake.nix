@@ -15,6 +15,25 @@
       forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
+      lib = {
+        mkBluefieldKexecAnywhereTarball = { pkgs, kexecConfig, name ? "bluefield-kexec-anywhere" }:
+          pkgs.runCommand "${name}-tarball"
+            {
+              nativeBuildInputs = with pkgs; [ gnutar xz ];
+            } ''
+            mkdir -p "$out/tarball" work/kexec
+
+            install -D -m 0755 ${kexecConfig.system.build.kexecTree}/kexec-boot work/kexec/run
+            install -D -m 0644 ${kexecConfig.system.build.kexecTree}/bzImage work/kexec/bzImage
+            install -D -m 0644 ${kexecConfig.system.build.kexecTree}/initrd.gz work/kexec/initrd.gz
+
+            tar --owner=0 --group=0 --numeric-owner \
+              --mode='u+rwX,go+rX,go-w' \
+              -C work -cJf "$out/tarball/${name}-${kexecConfig.system.nixos.label}.tar.xz" \
+              kexec
+          '';
+      };
+
       nixosModules = {
         bluefield-credentials = ./modules/bluefield-credentials.nix;
         bluefield-network = ./modules/bluefield-network.nix;
@@ -57,6 +76,22 @@
                 bluefield.credentials.rootAuthorizedKeys = [ dummyKey ];
               }
             ];
+          };
+          fakeKexecTree = pkgs.runCommand "fake-bluefield-kexec-tree" { } ''
+            mkdir -p "$out"
+            printf '#!/bin/sh\n' > "$out/kexec-boot"
+            chmod 0755 "$out/kexec-boot"
+            touch "$out/bzImage" "$out/initrd.gz"
+          '';
+          fakeKexecTarball = self.lib.mkBluefieldKexecAnywhereTarball {
+            inherit pkgs;
+            name = "fake-bluefield-kexec-anywhere";
+            kexecConfig = {
+              system = {
+                build.kexecTree = fakeKexecTree;
+                nixos.label = "test";
+              };
+            };
           };
         in
         {
@@ -139,6 +174,15 @@
               exit 1
             fi
 
+            touch "$out"
+          '';
+
+          bluefield-kexec-anywhere-tarball = pkgs.runCommand "bluefield-kexec-anywhere-tarball-check"
+            {
+              nativeBuildInputs = [ self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate ];
+            } ''
+            tarball=$(find ${fakeKexecTarball}/tarball -name '*.tar.xz' -print -quit)
+            bluefield-validate check-kexec-tarball "$tarball"
             touch "$out"
           '';
         });

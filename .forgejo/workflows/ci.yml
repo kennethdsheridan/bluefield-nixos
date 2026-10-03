@@ -1,0 +1,17 @@
+name: nix-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  flake-check:
+    runs-on: native
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show flake outputs
+        run: nix flake show
+      - name: Check flake
+        run: nix flake check --all-systems
+      - name: Build tarball validator check
+        run: nix build .#checks.x86_64-linux.bluefield-validate-kexec-tarball
