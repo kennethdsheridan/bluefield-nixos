@@ -42,9 +42,35 @@
         default = ./modules/bluefield-dpu.nix;
       };
 
-      packages = forAllSystems (pkgs: {
-        bluefield-validate = pkgs.callPackage ./tools/bluefield-validate/package.nix { };
-        default = self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate;
+      packages = forAllSystems (pkgs:
+        let
+          bluefieldValidate = pkgs.callPackage ./tools/bluefield-validate/package.nix { };
+          bluefieldBuildBfb = pkgs.writeShellApplication {
+            name = "bluefield-build-bfb";
+            runtimeInputs = [
+              bluefieldValidate
+              pkgs.bfscripts
+            ];
+            text = ''
+              exec bluefield-validate build-bfb "$@"
+            '';
+          };
+        in
+        {
+          bluefield-validate = bluefieldValidate;
+          bluefield-build-bfb = bluefieldBuildBfb;
+          default = bluefieldValidate;
+        });
+
+      apps = forAllSystems (pkgs: {
+        bluefield-validate = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate}/bin/bluefield-validate";
+        };
+        bluefield-build-bfb = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-build-bfb}/bin/bluefield-build-bfb";
+        };
       });
 
       checks = forAllSystems (pkgs:
@@ -93,6 +119,28 @@
               };
             };
           };
+          fakeMlxMkbfb = pkgs.writeShellScriptBin "mlx-mkbfb" ''
+            set -eu
+
+            if [ "''${1:-}" = "-c" ]; then
+              test -s "$2"
+              exit 0
+            fi
+
+            output=""
+            for arg in "$@"; do
+              case "$arg" in
+                --image=*) test -e "''${arg#--image=}" ;;
+                --initramfs=*) test -e "''${arg#--initramfs=}" ;;
+                --boot-args==*) : ;;
+                --boot-desc==*) : ;;
+                *) output="$arg" ;;
+              esac
+            done
+
+            test -n "$output"
+            printf 'fake bfb\n' > "$output"
+          '';
         in
         {
           bluefield-validate = self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate;
@@ -183,6 +231,25 @@
             } ''
             tarball=$(find ${fakeKexecTarball}/tarball -name '*.tar.xz' -print -quit)
             bluefield-validate check-kexec-tarball "$tarball"
+            touch "$out"
+          '';
+
+          bluefield-build-bfb-command = pkgs.runCommand "bluefield-build-bfb-command-check"
+            {
+              nativeBuildInputs = [ self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate ];
+            } ''
+            tarball=$(find ${fakeKexecTarball}/tarball -name '*.tar.xz' -print -quit)
+            printf 'fake base bfb\n' > base.bfb
+
+            bluefield-validate build-bfb \
+              --base-bfb base.bfb \
+              --kexec-tarball "$tarball" \
+              --output nixos-bluefield-installer.bfb \
+              --cmdline 'console=hvc0 init=/nix/store/fake/init' \
+              --description 'NixOS BlueField test installer' \
+              --mlx-mkbfb ${fakeMlxMkbfb}/bin/mlx-mkbfb
+
+            test -s nixos-bluefield-installer.bfb
             touch "$out"
           '';
         });

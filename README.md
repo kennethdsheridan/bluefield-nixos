@@ -32,8 +32,17 @@ Validated lab result:
 - `nixosModules.bluefield-dpu`
 - `nixosModules.bluefield-kexec-installer`
 - `packages.<system>.bluefield-validate`
+- `packages.<system>.bluefield-build-bfb`
+- `apps.<system>.bluefield-build-bfb`
 - `templates.minimal-dpu`
 - `templates.wrapper-flake`
+
+## Documentation
+
+- [Install workflow](docs/install.md): build a private kexec installer, smoke-test
+  tmfifo SSH, install to eMMC, and optionally wrap the installer as a BFB.
+- [Credentials](docs/credentials.md): keep operator SSH keys in private flakes.
+- [Recovery](docs/recovery.md): recover from stale EFI entries after eMMC writes.
 
 ## Quick Checks
 
@@ -48,6 +57,38 @@ authenticity check. Run it only on locally built or otherwise trusted tarballs.
 It requires nixos-anywhere kexec tarballs to contain only safe relative
 regular-file and directory entries, owned by `0:0`, without writable group/world
 bits or special mode bits.
+
+## Build a BFB Installer
+
+`bluefield-build-bfb` repacks a trusted nixos-anywhere kexec tarball into a
+BlueField bootstream by calling NVIDIA's `mlx-mkbfb` from `nixpkgs#bfscripts`.
+It requires a compatible NVIDIA BFB as the carrier image; keep that file outside
+the repository.
+
+```bash
+nix run .#bluefield-build-bfb -- \
+  --base-bfb ~/Downloads/bf-bundle-<release>.bfb \
+  --kexec-tarball ./result/tarball/bluefield-kexec-anywhere-<label>.tar.xz \
+  --output /tmp/nixos-bluefield-installer.bfb
+```
+
+The command validates the kexec tarball metadata, extracts only the kernel,
+initrd, and run script, derives the kernel command line, writes the BFB, and runs
+`mlx-mkbfb -c` on the result. Inspect the result before booting it:
+
+```bash
+nix shell nixpkgs#bfscripts -c mlx-mkbfb -d /tmp/nixos-bluefield-installer.bfb
+```
+
+Boot through RShim only after the target device, PSID, and recovery path are
+confirmed:
+
+```bash
+sudo bfb-install --rshim rshim0 --bfb /tmp/nixos-bluefield-installer.bfb
+```
+
+Prefer a boot-only carrier BFB when available. A full BF-Bundle carrier may
+include destructive firmware or OS-install payloads if used incorrectly.
 
 ## Credential Model
 
