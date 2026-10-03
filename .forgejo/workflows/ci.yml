@@ -6,7 +6,7 @@ on:
 
 jobs:
   flake-check:
-    runs-on: native
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - name: Show flake outputs
