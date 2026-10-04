@@ -4,7 +4,10 @@
 //! - validate the restricted `nixos-anywhere` kexec tarball layout expected by
 //!   this flake;
 //! - wrap NVIDIA's `mlx-mkbfb` tool to place that kexec payload into a
-//!   compatible carrier BFB.
+//!   compatible carrier BFB;
+//! - install a BFB through RShim in a way that can recover from missing
+//!   unprivileged access to `/dev/rshim*` by re-executing itself through `sudo`.
+//! - restore the host-side tmfifo address after interrupted RShim boot attempts.
 //!
 //! The checks are intentionally conservative because the resulting artifacts are
 //! used during recovery and install flows where a malformed payload can make the
@@ -15,7 +18,8 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tar::{Archive, EntryType};
 use xz2::read::XzDecoder;
@@ -48,6 +52,24 @@ fn run() -> Result<(), String> {
                 build_bfb(BuildBfbArgs::parse(args)?)
             }
         }
+        Some("install-bfb") => {
+            let args: Vec<String> = args.collect();
+            if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+                println!("{}", install_bfb_usage());
+                Ok(())
+            } else {
+                install_bfb(InstallBfbArgs::parse(args.clone())?, args)
+            }
+        }
+        Some("repair-host-tmfifo") => {
+            let args: Vec<String> = args.collect();
+            if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+                println!("{}", repair_host_tmfifo_usage());
+                Ok(())
+            } else {
+                repair_host_tmfifo(RepairHostTmfifoArgs::parse(args.clone())?, args)
+            }
+        }
         Some("--help") | Some("-h") | None => {
             print_help();
             Ok(())
@@ -65,6 +87,10 @@ fn print_help() {
         "  check-kexec-tarball <tarball>  Check trusted nixos-anywhere kexec tarball metadata"
     );
     println!("  build-bfb [options]             Build a BlueField BFB from a kexec tarball");
+    println!(
+        "  install-bfb [options]           Install a BFB over local RShim with sudo self-heal"
+    );
+    println!("  repair-host-tmfifo [options]    Restore host-side tmfifo IPv4 settings");
     println!();
     println!("build-bfb options:");
     println!("  --base-bfb <path>        Compatible NVIDIA BFB carrier");
@@ -74,6 +100,442 @@ fn print_help() {
     println!("  --description <string>   BFB boot menu description");
     println!("  --mlx-mkbfb <path>       mlx-mkbfb executable (default: mlx-mkbfb)");
     println!("  --keep-workdir           Keep temporary extracted payload files");
+    println!();
+    println!("install-bfb options:");
+    println!("  --bfb <path>             BFB image to stream through RShim");
+    println!("  --rshim <device>         RShim device name (default: rshim0)");
+    println!("  --bfb-install <path>     bfb-install executable (default: bfb-install)");
+    println!("  --sudo <path>            sudo executable for privilege self-heal (default: sudo)");
+    println!("  --keep-log               Preserve bfb-install log output");
+    println!("  --verbose                Enable verbose bfb-install output");
+    println!("  --timeout-seconds <n>    Stop bfb-install if it hangs (default: 900)");
+    println!("  --dry-run                Print the install command without streaming the BFB");
+    println!();
+    println!("repair-host-tmfifo options:");
+    println!("  --interface <name>       Host tmfifo interface (default: tmfifo_net0)");
+    println!("  --address <cidr>         Host tmfifo address (default: 192.168.100.1/30)");
+    println!("  --ip <path>              ip executable (default: ip)");
+    println!("  --sudo <path>            sudo executable for privilege self-heal (default: sudo)");
+    println!("  --dry-run                Print commands without changing networking");
+}
+
+/// Parsed arguments for restoring the host side of the tmfifo link.
+struct RepairHostTmfifoArgs {
+    interface: String,
+    address: String,
+    ip: PathBuf,
+    sudo: PathBuf,
+    dry_run: bool,
+}
+
+impl RepairHostTmfifoArgs {
+    /// Parses `repair-host-tmfifo` options.
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let mut interface = "tmfifo_net0".to_string();
+        let mut address = "192.168.100.1/30".to_string();
+        let mut ip = PathBuf::from("ip");
+        let mut sudo = default_sudo_path();
+        let mut dry_run = false;
+        let mut iter = args.into_iter();
+
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--interface" => {
+                    interface = required_repair_option_value(&mut iter, "--interface")?
+                }
+                "--address" => address = required_repair_option_value(&mut iter, "--address")?,
+                "--ip" => ip = required_repair_option_value(&mut iter, "--ip")?.into(),
+                "--sudo" => sudo = required_repair_option_value(&mut iter, "--sudo")?.into(),
+                "--dry-run" => dry_run = true,
+                "--help" | "-h" => return Err(repair_host_tmfifo_usage()),
+                _ => {
+                    return Err(format!(
+                        "unknown repair-host-tmfifo option: {arg}\n{}",
+                        repair_host_tmfifo_usage()
+                    ))
+                }
+            }
+        }
+
+        Ok(Self {
+            interface,
+            address,
+            ip,
+            sudo,
+            dry_run,
+        })
+    }
+}
+
+/// Reads a required `repair-host-tmfifo` option value from the argument iterator.
+fn required_repair_option_value(
+    iter: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, String> {
+    iter.next()
+        .ok_or_else(|| format!("missing value for {option}\n{}", repair_host_tmfifo_usage()))
+}
+
+/// Returns the one-line `repair-host-tmfifo` usage string used in parse errors.
+fn repair_host_tmfifo_usage() -> String {
+    "usage: bluefield-validate repair-host-tmfifo [--interface <name>] [--address <cidr>] [--ip <path>] [--sudo <path>] [--dry-run]".to_string()
+}
+
+/// Restores the host-side tmfifo address and link state, using sudo when needed.
+fn repair_host_tmfifo(args: RepairHostTmfifoArgs, raw_args: Vec<String>) -> Result<(), String> {
+    if args.dry_run {
+        println!(
+            "would run: {} address replace {} dev {}",
+            args.ip.display(),
+            args.address,
+            args.interface
+        );
+        println!(
+            "would run: {} link set {} up",
+            args.ip.display(),
+            args.interface
+        );
+        return Ok(());
+    }
+
+    match run_host_tmfifo_repair(&args) {
+        Ok(()) => {
+            println!("ok: restored {} on {}", args.address, args.interface);
+            Ok(())
+        }
+        Err(error) if env::var_os("BLUEFIELD_VALIDATE_REPAIR_SUDO_REEXEC").is_none() => {
+            sudo_reexec_repair_host_tmfifo(&args, &raw_args, &error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Applies the host-side tmfifo address and brings the link up.
+fn run_host_tmfifo_repair(args: &RepairHostTmfifoArgs) -> Result<(), String> {
+    run_ip_command(
+        &args.ip,
+        &["address", "replace", &args.address, "dev", &args.interface],
+    )?;
+    run_ip_command(&args.ip, &["link", "set", &args.interface, "up"])
+}
+
+/// Runs one `ip` command and returns a contextual error on failure.
+fn run_ip_command(ip: &Path, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(ip)
+        .args(args)
+        .status()
+        .map_err(|error| format!("failed to run {}: {error}", ip.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} {} failed with status {status}",
+            ip.display(),
+            args.join(" ")
+        ))
+    }
+}
+
+/// Re-executes tmfifo host repair through sudo while preserving the Nix wrapper PATH.
+fn sudo_reexec_repair_host_tmfifo(
+    args: &RepairHostTmfifoArgs,
+    raw_args: &[String],
+    original_error: &str,
+) -> Result<(), String> {
+    let current_exe = env::current_exe().map_err(|error| {
+        format!("failed to resolve current executable for sudo re-exec: {error}")
+    })?;
+    let path = env::var_os("PATH").unwrap_or_default();
+    let status = Command::new(&args.sudo)
+        .arg("env")
+        .arg("BLUEFIELD_VALIDATE_REPAIR_SUDO_REEXEC=1")
+        .arg(format!("PATH={}", path.to_string_lossy()))
+        .arg(current_exe)
+        .arg("repair-host-tmfifo")
+        .args(raw_args)
+        .status()
+        .map_err(|error| {
+            format!(
+                "failed to run {} for sudo re-exec: {error}",
+                args.sudo.display()
+            )
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} re-exec failed with status {status}; original error: {original_error}",
+            args.sudo.display()
+        ))
+    }
+}
+
+/// Prefers the NixOS setuid sudo wrapper over a non-setuid store sudo binary.
+fn default_sudo_path() -> PathBuf {
+    let nixos_wrapper = Path::new("/run/wrappers/bin/sudo");
+    if nixos_wrapper.exists() {
+        nixos_wrapper.to_path_buf()
+    } else {
+        PathBuf::from("sudo")
+    }
+}
+
+/// Parsed arguments for `bluefield-validate install-bfb`.
+struct InstallBfbArgs {
+    bfb: PathBuf,
+    rshim: String,
+    bfb_install: PathBuf,
+    sudo: PathBuf,
+    keep_log: bool,
+    verbose: bool,
+    timeout_seconds: u64,
+    dry_run: bool,
+}
+
+impl InstallBfbArgs {
+    /// Parses `install-bfb` options while preserving unknown-option failures.
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let mut bfb = None;
+        let mut rshim = "rshim0".to_string();
+        let mut bfb_install = PathBuf::from("bfb-install");
+        let mut sudo = default_sudo_path();
+        let mut keep_log = false;
+        let mut verbose = false;
+        let mut timeout_seconds = 900;
+        let mut dry_run = false;
+        let mut iter = args.into_iter();
+
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--bfb" => bfb = Some(required_install_option_value(&mut iter, "--bfb")?.into()),
+                "--rshim" => rshim = required_install_option_value(&mut iter, "--rshim")?,
+                "--bfb-install" => {
+                    bfb_install = required_install_option_value(&mut iter, "--bfb-install")?.into()
+                }
+                "--sudo" => sudo = required_install_option_value(&mut iter, "--sudo")?.into(),
+                "--keep-log" => keep_log = true,
+                "--verbose" => verbose = true,
+                "--timeout-seconds" => {
+                    timeout_seconds = required_install_option_value(&mut iter, "--timeout-seconds")?
+                        .parse()
+                        .map_err(|error| format!("invalid --timeout-seconds value: {error}"))?
+                }
+                "--dry-run" => dry_run = true,
+                "--help" | "-h" => return Err(install_bfb_usage()),
+                _ => {
+                    return Err(format!(
+                        "unknown install-bfb option: {arg}\n{}",
+                        install_bfb_usage()
+                    ))
+                }
+            }
+        }
+
+        Ok(Self {
+            bfb: bfb.ok_or_else(install_bfb_usage)?,
+            rshim,
+            bfb_install,
+            sudo,
+            keep_log,
+            verbose,
+            timeout_seconds,
+            dry_run,
+        })
+    }
+}
+
+/// Reads a required `install-bfb` option value from the argument iterator.
+fn required_install_option_value(
+    iter: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, String> {
+    iter.next()
+        .ok_or_else(|| format!("missing value for {option}\n{}", install_bfb_usage()))
+}
+
+/// Returns the one-line `install-bfb` usage string used in parse errors and help output.
+fn install_bfb_usage() -> String {
+    "usage: bluefield-validate install-bfb --bfb <path> [--rshim <device>] [--bfb-install <path>] [--sudo <path>] [--keep-log] [--verbose] [--timeout-seconds <n>] [--dry-run]".to_string()
+}
+
+/// Installs a BFB over RShim, re-executing through sudo if local RShim nodes are protected.
+fn install_bfb(args: InstallBfbArgs, raw_args: Vec<String>) -> Result<(), String> {
+    if !args.bfb.is_file() {
+        return Err(format!("BFB does not exist: {}", args.bfb.display()));
+    }
+
+    let rshim_arg = rshim_argument(&args.rshim)?;
+    let command_args = bfb_install_args(&args, &rshim_arg);
+    if args.dry_run {
+        println!(
+            "would run: {} {}",
+            args.bfb_install.display(),
+            command_args.join(" ")
+        );
+        return Ok(());
+    }
+
+    let rshim_dir = rshim_device_dir(&args.rshim)?;
+    let misc = rshim_dir.join("misc");
+    let boot = rshim_dir.join("boot");
+    if !misc.exists() || !boot.exists() {
+        return Err(format!(
+            "RShim device is missing required nodes under {}",
+            rshim_dir.display()
+        ));
+    }
+
+    if !rshim_accessible(&misc, &boot) {
+        return sudo_reexec_install_bfb(&args, &raw_args, &rshim_dir);
+    }
+
+    let mut command = Command::new(&args.bfb_install);
+    command.args(&command_args);
+    let status = run_with_timeout(&mut command, Duration::from_secs(args.timeout_seconds))
+        .map_err(|error| format!("failed to run {}: {error}", args.bfb_install.display()))?;
+    if !status.success() {
+        return Err(format!(
+            "{} failed with status {status}",
+            args.bfb_install.display()
+        ));
+    }
+
+    println!("ok: streamed {} to {rshim_arg}", args.bfb.display());
+    Ok(())
+}
+
+/// Builds the device directory path for a local RShim argument.
+fn rshim_device_dir(rshim: &str) -> Result<PathBuf, String> {
+    if rshim.contains(':') {
+        return Err("install-bfb self-heal supports local RShim devices only".to_string());
+    }
+
+    if rshim.starts_with("/dev/") {
+        Ok(PathBuf::from(rshim))
+    } else {
+        Ok(Path::new("/dev").join(rshim))
+    }
+}
+
+/// Converts `/dev/rshimN` into the `rshimN` argument expected by bfb-install.
+fn rshim_argument(rshim: &str) -> Result<String, String> {
+    if rshim.starts_with("/dev/") {
+        Path::new(rshim)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("invalid RShim device path: {rshim}"))
+    } else {
+        Ok(rshim.to_string())
+    }
+}
+
+/// Checks whether the current process can read RShim status and open the boot node for writing.
+fn rshim_accessible(misc: &Path, boot: &Path) -> bool {
+    File::open(misc).is_ok() && fs::OpenOptions::new().write(true).open(boot).is_ok()
+}
+
+/// Re-executes this helper through sudo instead of relying on bfb-install's internal sudo lookup.
+fn sudo_reexec_install_bfb(
+    args: &InstallBfbArgs,
+    raw_args: &[String],
+    rshim_dir: &Path,
+) -> Result<(), String> {
+    if env::var_os("BLUEFIELD_VALIDATE_SUDO_REEXEC").is_some() {
+        return Err(format!(
+            "RShim nodes under {} are still inaccessible after sudo re-exec",
+            rshim_dir.display()
+        ));
+    }
+
+    let current_exe = env::current_exe().map_err(|error| {
+        format!("failed to resolve current executable for sudo re-exec: {error}")
+    })?;
+    let path = env::var_os("PATH").unwrap_or_default();
+    let mut command = Command::new(&args.sudo);
+    command
+        .arg("env")
+        .arg("BLUEFIELD_VALIDATE_SUDO_REEXEC=1")
+        .arg(format!("PATH={}", path.to_string_lossy()))
+        .arg(current_exe)
+        .arg("install-bfb")
+        .args(raw_args);
+
+    if args.dry_run {
+        println!(
+            "would re-exec through sudo for protected {} using {}",
+            rshim_dir.display(),
+            args.sudo.display()
+        );
+        return Ok(());
+    }
+
+    let status = run_with_timeout(&mut command, Duration::from_secs(args.timeout_seconds + 60))
+        .map_err(|error| {
+            format!(
+                "failed to run {} for sudo re-exec: {error}",
+                args.sudo.display()
+            )
+        })?;
+    if !status.success() {
+        return Err(format!(
+            "{} re-exec failed with status {status}",
+            args.sudo.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Builds the `bfb-install` argv used after access preflight and optional sudo re-exec.
+fn bfb_install_args(args: &InstallBfbArgs, rshim_arg: &str) -> Vec<String> {
+    let mut command_args = vec![
+        "-r".to_string(),
+        rshim_arg.to_string(),
+        "-b".to_string(),
+        args.bfb.display().to_string(),
+    ];
+    if args.keep_log {
+        command_args.push("-k".to_string());
+    }
+    if args.verbose {
+        command_args.push("-v".to_string());
+    }
+    command_args
+}
+
+/// Runs a child process with a bounded wait and kills it if it stops making progress forever.
+fn run_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn child process: {error}"))?;
+    let start = SystemTime::now();
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed to poll child process: {error}"))?
+        {
+            return Ok(status);
+        }
+
+        let elapsed = SystemTime::now()
+            .duration_since(start)
+            .map_err(|error| format!("system clock moved backwards while waiting: {error}"))?;
+        if elapsed >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "child process exceeded {}s timeout",
+                timeout.as_secs()
+            ));
+        }
+
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Validates that a tarball contains the exact safe kexec layout this flake consumes.

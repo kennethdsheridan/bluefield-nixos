@@ -61,10 +61,35 @@
               exec bluefield-validate build-bfb "$@"
             '';
           };
+          # Run BFB streaming through Rust first so protected RShim devices are
+          # handled by a controlled sudo re-exec instead of bfb-install's
+          # internal sudo lookup, which can fail under Nix's wrapped PATH.
+          bluefieldInstallBfb = pkgs.writeShellApplication {
+            name = "bluefield-install-bfb";
+            runtimeInputs = [
+              bluefieldValidate
+              pkgs.rshim-user-space
+            ];
+            text = ''
+              exec bluefield-validate install-bfb "$@"
+            '';
+          };
+          bluefieldRepairHostTmfifo = pkgs.writeShellApplication {
+            name = "bluefield-repair-host-tmfifo";
+            runtimeInputs = [
+              bluefieldValidate
+              pkgs.iproute2
+            ];
+            text = ''
+              exec bluefield-validate repair-host-tmfifo "$@"
+            '';
+          };
         in
         {
           bluefield-validate = bluefieldValidate;
           bluefield-build-bfb = bluefieldBuildBfb;
+          bluefield-install-bfb = bluefieldInstallBfb;
+          bluefield-repair-host-tmfifo = bluefieldRepairHostTmfifo;
           default = bluefieldValidate;
         });
 
@@ -76,6 +101,14 @@
         bluefield-build-bfb = {
           type = "app";
           program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-build-bfb}/bin/bluefield-build-bfb";
+        };
+        bluefield-install-bfb = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-install-bfb}/bin/bluefield-install-bfb";
+        };
+        bluefield-repair-host-tmfifo = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-repair-host-tmfifo}/bin/bluefield-repair-host-tmfifo";
         };
       });
 
@@ -262,6 +295,36 @@
               --mlx-mkbfb ${fakeMlxMkbfb}/bin/mlx-mkbfb
 
             test -s nixos-bluefield-installer.bfb
+            touch "$out"
+          '';
+
+          bluefield-install-bfb-command = pkgs.runCommand "bluefield-install-bfb-command-check"
+            {
+              nativeBuildInputs = [ self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate ];
+            } ''
+            printf 'fake bfb\n' > test.bfb
+            bluefield-validate install-bfb \
+              --bfb test.bfb \
+              --rshim rshim0 \
+              --bfb-install bfb-install \
+              --sudo sudo \
+              --keep-log \
+              --verbose \
+              --timeout-seconds 5 \
+              --dry-run
+            touch "$out"
+          '';
+
+          bluefield-repair-host-tmfifo-command = pkgs.runCommand "bluefield-repair-host-tmfifo-command-check"
+            {
+              nativeBuildInputs = [ self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate ];
+            } ''
+            bluefield-validate repair-host-tmfifo \
+              --interface tmfifo_net0 \
+              --address 192.168.100.1/30 \
+              --ip ip \
+              --sudo sudo \
+              --dry-run
             touch "$out"
           '';
         });
