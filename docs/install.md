@@ -20,6 +20,9 @@ The modules default to the common RShim tmfifo link:
 
 Override `bluefield.tmfifo.*` if your environment differs.
 
+NVIDIA documents RShim, `/dev/rshim<N>`, and tmfifo behavior in
+[SoC Management Interface (RShim)](https://networking-docs.nvidia.com/bsp/4.16.0/soc-management-interface-rshim).
+
 ## Build the private installer
 
 Start from `examples/wrapper-flake`, replace `operatorKey`, and point the input
@@ -66,6 +69,11 @@ The expected installer hostname is `bluefield-dpu-installer` unless overridden.
 The included disko example erases `/dev/mmcblk0` and intentionally leaves
 `/dev/mmcblk0boot0` and `/dev/mmcblk0boot1` unmanaged. Import it only from a
 private host configuration after confirming the target device.
+
+Those boot partitions contain BlueField boot firmware, not the NixOS rootfs. See
+[Recovery](recovery.md) and NVIDIA's
+[BlueField Boot Flow and BFB Format](https://networking-docs.nvidia.com/bsp/4.16.0/appendix-bluefield-boot-flow-and-bfb-format)
+before using tools such as `bfrec` or `mlxbf-bootctl`.
 
 ```nix
 {
@@ -118,3 +126,7 @@ Inspect and boot only after confirming the target device and recovery path:
 nix shell nixpkgs#bfscripts -c mlx-mkbfb -d /tmp/nixos-bluefield-installer.bfb
 sudo bfb-install --rshim rshim0 --bfb /tmp/nixos-bluefield-installer.bfb
 ```
+
+NVIDIA's [BF-Bundle Installation and Upgrade](https://docs.nvidia.com/doca/archive/3-5-0/bf-bundle-installation-and-upgrade)
+documents `bfb-install`, tmfifo defaults, DOCA installer behavior, and custom BFB
+constraints such as secure boot expectations.
