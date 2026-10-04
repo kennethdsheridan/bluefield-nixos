@@ -16,13 +16,22 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::BufReader;
+use std::os::raw::c_int;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tar::{Archive, EntryType};
 use xz2::read::XzDecoder;
+
+const SIGTERM: c_int = 15;
+const SIGKILL: c_int = 9;
+
+extern "C" {
+    fn kill(pid: c_int, sig: c_int) -> c_int;
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -509,10 +518,12 @@ fn run_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<std::process::ExitStatus, String> {
+    command.process_group(0);
+
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn child process: {error}"))?;
-    let start = SystemTime::now();
+    let start = Instant::now();
 
     loop {
         if let Some(status) = child
@@ -522,19 +533,98 @@ fn run_with_timeout(
             return Ok(status);
         }
 
-        let elapsed = SystemTime::now()
-            .duration_since(start)
-            .map_err(|error| format!("system clock moved backwards while waiting: {error}"))?;
-        if elapsed >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+        if start.elapsed() >= timeout {
+            let _ = signal_process_group(child.id(), SIGTERM);
+            if !wait_for_child(&mut child, Duration::from_secs(5))? {
+                let _ = signal_process_group(child.id(), SIGKILL);
+                let _ = child.wait();
+            }
             return Err(format!(
-                "child process exceeded {}s timeout",
+                "child process group exceeded {}s timeout",
                 timeout.as_secs()
             ));
         }
 
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Waits a short grace period for a child to exit after timeout signaling.
+fn wait_for_child(child: &mut std::process::Child, timeout: Duration) -> Result<bool, String> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if child
+            .try_wait()
+            .map_err(|error| format!("failed to poll child process after timeout: {error}"))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(false)
+}
+
+/// Sends a signal to the child's whole process group so shell pipelines do not survive timeouts.
+fn signal_process_group(child_id: u32, signal: c_int) -> Result<(), String> {
+    let pgid: c_int = child_id
+        .try_into()
+        .map_err(|_| format!("child process id {child_id} does not fit in pid_t"))?;
+    let result = unsafe { kill(-pgid, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to signal child process group {pgid}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_with_timeout_kills_shell_pipeline_process_group() {
+        let marker = env::temp_dir().join(format!(
+            "bluefield-validate-timeout-child-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&marker);
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; wait")
+            .arg("bluefield-timeout-test")
+            .arg(&marker);
+
+        let result = run_with_timeout(&mut command, Duration::from_secs(1));
+        assert!(result.is_err());
+
+        let child_pid: c_int = fs::read_to_string(&marker)
+            .expect("shell should write background child pid before timeout")
+            .trim()
+            .parse()
+            .expect("background child pid should parse");
+
+        for _ in 0..20 {
+            if !process_exists(child_pid) {
+                let _ = fs::remove_file(&marker);
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let _ = unsafe { kill(child_pid, SIGKILL) };
+        let _ = fs::remove_file(&marker);
+        panic!("background child survived process-group timeout cleanup");
+    }
+
+    fn process_exists(pid: c_int) -> bool {
+        let result = unsafe { kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(3)
     }
 }
 
