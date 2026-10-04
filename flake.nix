@@ -16,6 +16,9 @@
     in
     {
       lib = {
+        # Produce the tarball shape consumed by `bluefield-validate build-bfb`.
+        # Ownership and modes are fixed here so the validator can reject drift in
+        # downstream or hand-built archives before a recovery BFB is generated.
         mkBluefieldKexecAnywhereTarball = { pkgs, kexecConfig, name ? "bluefield-kexec-anywhere" }:
           pkgs.runCommand "${name}-tarball"
             {
@@ -45,6 +48,9 @@
       packages = forAllSystems (pkgs:
         let
           bluefieldValidate = pkgs.callPackage ./tools/bluefield-validate/package.nix { };
+          # Keep the BFB builder as a Nix-packaged app so operators get the
+          # matching NVIDIA `mlx-mkbfb` helper from `bfscripts` instead of a
+          # workstation-local copy with unknown behavior.
           bluefieldBuildBfb = pkgs.writeShellApplication {
             name = "bluefield-build-bfb";
             runtimeInputs = [
@@ -103,6 +109,8 @@
               }
             ];
           };
+          # The tests exercise the tarball and BFB flows without requiring a
+          # real BlueField carrier image or NVIDIA tooling during flake checks.
           fakeKexecTree = pkgs.runCommand "fake-bluefield-kexec-tree" { } ''
             mkdir -p "$out"
             printf '#!/bin/sh\n' > "$out/kexec-boot"
@@ -146,6 +154,8 @@
           bluefield-validate = self.packages.${pkgs.stdenv.hostPlatform.system}.bluefield-validate;
 
           bluefield-module-eval = pkgs.runCommand "bluefield-module-eval" { } ''
+            # Force evaluation of both install and kexec profiles without
+            # building full NixOS systems for every check run.
             cat > "$out" <<'EOF'
             ${builtins.unsafeDiscardStringContext dpuSystem.config.system.build.toplevel.drvPath}
             ${builtins.unsafeDiscardStringContext kexecSystem.config.system.build.toplevel.drvPath}
@@ -161,6 +171,8 @@
                 pkgs.xz
               ];
             } ''
+            # Cover the archive metadata hazards that matter most for a recovery
+            # payload: link traversal, non-root ownership, and unsafe modes.
             mkdir -p good/kexec bad-link/kexec bad-traversal/kexec bad-owner/kexec bad-mode/kexec bad-space/kexec bad-dot/kexec
 
             printf '#!/bin/sh\n' > good/kexec/run

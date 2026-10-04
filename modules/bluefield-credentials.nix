@@ -1,3 +1,6 @@
+# Credential policy shared by the installed DPU and kexec installer profiles.
+# Public modules do not embed keys; private wrapper flakes provide them through
+# these options so the reusable repo can stay safe to publish.
 { config, lib, ... }:
 
 let

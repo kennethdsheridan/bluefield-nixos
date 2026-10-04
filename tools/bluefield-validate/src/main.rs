@@ -1,3 +1,15 @@
+//! Validation and build helper for NixOS-on-BlueField recovery artifacts.
+//!
+//! The binary has two responsibilities:
+//! - validate the restricted `nixos-anywhere` kexec tarball layout expected by
+//!   this flake;
+//! - wrap NVIDIA's `mlx-mkbfb` tool to place that kexec payload into a
+//!   compatible carrier BFB.
+//!
+//! The checks are intentionally conservative because the resulting artifacts are
+//! used during recovery and install flows where a malformed payload can make the
+//! DPU unreachable over tmfifo.
+
 use std::env;
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -44,6 +56,7 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Prints the top-level command help for the small hand-rolled CLI.
 fn print_help() {
     println!("bluefield-validate");
     println!();
@@ -63,6 +76,7 @@ fn print_help() {
     println!("  --keep-workdir           Keep temporary extracted payload files");
 }
 
+/// Validates that a tarball contains the exact safe kexec layout this flake consumes.
 fn check_kexec_tarball(path: &Path) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("tarball does not exist: {}", path.display()));
@@ -91,6 +105,7 @@ fn check_kexec_tarball(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Parsed arguments for `bluefield-validate build-bfb`.
 struct BuildBfbArgs {
     base_bfb: PathBuf,
     kexec_tarball: PathBuf,
@@ -102,6 +117,7 @@ struct BuildBfbArgs {
 }
 
 impl BuildBfbArgs {
+    /// Parses `build-bfb` options without pulling in a CLI dependency for this small tool.
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut base_bfb = None;
         let mut kexec_tarball = None;
@@ -150,6 +166,7 @@ impl BuildBfbArgs {
     }
 }
 
+/// Reads a required option value from the argument iterator.
 fn required_option_value(
     iter: &mut impl Iterator<Item = String>,
     option: &str,
@@ -158,10 +175,12 @@ fn required_option_value(
         .ok_or_else(|| format!("missing value for {option}\n{}", build_bfb_usage()))
 }
 
+/// Returns the one-line `build-bfb` usage string used in parse errors and help output.
 fn build_bfb_usage() -> String {
     "usage: bluefield-validate build-bfb --base-bfb <path> --kexec-tarball <path> --output <path> [--cmdline <string>] [--description <string>] [--mlx-mkbfb <path>] [--keep-workdir]".to_string()
 }
 
+/// Builds a custom BlueField BFB from a validated kexec tarball and carrier BFB.
 fn build_bfb(args: BuildBfbArgs) -> Result<(), String> {
     if !args.base_bfb.is_file() {
         return Err(format!(
@@ -211,6 +230,7 @@ fn build_bfb(args: BuildBfbArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Extracts the trusted kexec payload members into a temporary working directory.
 fn extract_kexec_payload(
     tarball: &Path,
     image_path: &Path,
@@ -265,6 +285,7 @@ fn extract_kexec_payload(
     Ok(())
 }
 
+/// Extracts the kernel command line from the nixos-anywhere generated `kexec/run` script.
 fn parse_kexec_cmdline(run_script: &str) -> Result<String, String> {
     let marker = "--command-line \"";
     let start = run_script
@@ -278,6 +299,7 @@ fn parse_kexec_cmdline(run_script: &str) -> Result<String, String> {
     Ok(rest[..end].to_string())
 }
 
+/// Invokes `mlx-mkbfb` to combine the carrier BFB with the custom boot payload.
 fn run_mlx_mkbfb(
     mlx_mkbfb: &Path,
     base_bfb: &Path,
@@ -291,6 +313,8 @@ fn run_mlx_mkbfb(
         .arg(base_bfb)
         .arg(format!("--image={}", image_path.display()))
         .arg(format!("--initramfs={}", initrd_path.display()))
+        // mlx-mkbfb uses the double equals form for values that can contain
+        // additional `=` characters, especially full kernel command lines.
         .arg(format!("--boot-args=={cmdline}"))
         .arg(format!("--boot-desc=={description}"))
         .arg(output)
@@ -307,6 +331,7 @@ fn run_mlx_mkbfb(
     Ok(())
 }
 
+/// Verifies the generated BFB using `mlx-mkbfb -c` before reporting success.
 fn run_mlx_mkbfb_check(mlx_mkbfb: &Path, output: &Path) -> Result<(), String> {
     let status = Command::new(mlx_mkbfb)
         .arg("-c")
@@ -325,12 +350,14 @@ fn run_mlx_mkbfb_check(mlx_mkbfb: &Path, output: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Temporary work directory that removes itself unless explicitly kept for debugging.
 struct TempWorkdir {
     path: PathBuf,
     keep: bool,
 }
 
 impl TempWorkdir {
+    /// Creates a unique temporary directory under the process temp directory.
     fn create(prefix: &str) -> Result<Self, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -342,10 +369,12 @@ impl TempWorkdir {
         Ok(Self { path, keep: false })
     }
 
+    /// Returns the temporary directory path.
     fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Marks the directory as retained and returns its path for operator inspection.
     fn keep(mut self) -> PathBuf {
         self.keep = true;
         self.path.clone()
@@ -360,12 +389,14 @@ impl Drop for TempWorkdir {
     }
 }
 
+/// Sanitized metadata for one tar entry.
 #[derive(Debug)]
 struct TarEntry {
     path: PathBuf,
     entry_type: EntryType,
 }
 
+/// Reads and validates tar entry metadata without extracting untrusted paths first.
 fn read_tar_entries(path: &Path) -> Result<Vec<TarEntry>, String> {
     let file =
         File::open(path).map_err(|error| format!("failed to open {}: {error}", path.display()))?;
@@ -409,6 +440,7 @@ fn read_tar_entries(path: &Path) -> Result<Vec<TarEntry>, String> {
     Ok(entries)
 }
 
+/// Allows only regular files and directories in recovery tarballs.
 fn validate_entry_type(entry_type: EntryType, path: &Path) -> Result<(), String> {
     if entry_type.is_file() || entry_type.is_dir() {
         return Ok(());
@@ -420,6 +452,7 @@ fn validate_entry_type(entry_type: EntryType, path: &Path) -> Result<(), String>
     ))
 }
 
+/// Rejects absolute, parent-relative, and otherwise non-normal tar paths.
 fn validate_relative_path(path: &Path) -> Result<(), String> {
     if path.is_absolute() {
         return Err(format!("unsafe absolute tar path: {}", path.display()));
@@ -435,11 +468,13 @@ fn validate_relative_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Normalizes a tar path after proving it is relative and component-safe.
 fn normalized_relative_path(path: &Path) -> Result<PathBuf, String> {
     validate_relative_path(path)?;
     Ok(path.components().collect())
 }
 
+/// Requires root-owned tar entries so user-built archives cannot smuggle unsafe metadata.
 fn validate_owner(uid: u64, gid: u64, path: &Path) -> Result<(), String> {
     if uid != 0 || gid != 0 {
         return Err(format!(
@@ -451,6 +486,7 @@ fn validate_owner(uid: u64, gid: u64, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Rejects special or writable modes and enforces executable/searchable bits where needed.
 fn validate_mode(mode: u32, entry_type: EntryType, path: &Path) -> Result<(), String> {
     if mode & 0o7000 != 0 {
         return Err(format!(

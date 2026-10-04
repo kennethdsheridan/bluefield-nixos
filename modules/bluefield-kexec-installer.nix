@@ -1,3 +1,6 @@
+# Ephemeral nixos-anywhere installer profile for BlueField DPUs. It intentionally
+# favors SSH/tmfifo reachability over host-specific persistence so a failed full
+# install can be retried from the management link.
 { config, lib, modulesPath, pkgs, ... }:
 
 let
@@ -96,6 +99,8 @@ in
     };
 
     users.users = {
+      # Root always receives recovery keys. The normal installer `nixos` user is
+      # optional so public examples do not imply an extra default login surface.
       root.openssh.authorizedKeys.keys = credentials.rootAuthorizedKeys
         ++ lib.optionals (credentials.adminUser == "root") credentials.authorizedKeys;
     } // lib.optionalAttrs (cfg.kexecInstaller.enableNixosBootstrapUser || credentials.adminUser == "nixos") {

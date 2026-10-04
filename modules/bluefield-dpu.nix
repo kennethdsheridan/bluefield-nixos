@@ -1,3 +1,6 @@
+# Baseline installed-DPU profile. Keep this module recovery-first: the defaults
+# preserve RShim/tmfifo access and an AArch64 removable EFI fallback before
+# enabling conveniences such as promoted EFI boot entries.
 { config, lib, modulesPath, pkgs, ... }:
 
 let
@@ -109,6 +112,9 @@ in
           modprobe mlxbf-tmfifo || true
           modprobe virtio_net || true
 
+          # The tmfifo device can appear under platform virtio paths before it
+          # has the final stable interface name. Poll both locations so early
+          # boot evidence still works across kernel enumeration timing changes.
           for _ in $(seq 1 60); do
             tmfifo_if=""
             for net_path in /sys/devices/platform/MLNXBF01:00/virtio*/net/*; do
@@ -164,6 +170,8 @@ in
               efiBootloaderId = "NixOS";
             }
           ];
+          # When GRUB is allowed to write a named EFI boot entry, still refresh
+          # the removable fallback path used by BlueField UEFI recovery flows.
           extraInstallCommands = lib.mkIf (cfg.boot.removableEfi && cfg.boot.promoteEfiBootEntry) ''
             grub_efi=/boot/efi/EFI/NixOS/grubaa64.efi
             fallback_efi=/boot/efi/EFI/BOOT/BOOTAA64.EFI

@@ -1,3 +1,6 @@
+# Shared BlueField networking defaults for both installed systems and installer
+# images. tmfifo is kept deterministic because it is the primary RShim recovery
+# path when normal Ethernet or OOB management is not available.
 { config, lib, pkgs, ... }:
 
 let
@@ -91,6 +94,8 @@ in
           modprobe mlxbf-tmfifo || true
           modprobe virtio_net || true
 
+          # BlueField kernels may expose the tmfifo netdev before udev has named
+          # it. Rename it to the configured stable name before SSH starts.
           for _ in $(seq 1 60); do
             tmfifo_if=""
             for net_path in /sys/devices/platform/MLNXBF01:00/virtio*/net/*; do
