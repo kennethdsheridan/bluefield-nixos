@@ -30,7 +30,11 @@ Validated lab result:
 - `nixosModules.bluefield-kexec-installer`
 - `packages.<system>.bluefield-validate`
 - `packages.<system>.bluefield-build-bfb`
+- `packages.<system>.bluefield-install-bfb`
+- `packages.<system>.bluefield-repair-host-tmfifo`
 - `apps.<system>.bluefield-build-bfb`
+- `apps.<system>.bluefield-install-bfb`
+- `apps.<system>.bluefield-repair-host-tmfifo`
 - `templates.minimal-dpu`
 - `templates.wrapper-flake`
 
@@ -51,6 +55,9 @@ nix build .#bluefield-validate
 - Keep SSH public keys and operator-specific host config outside this public repo.
 - Use the removable EFI fallback before reflashing if an install reaches the UEFI
   shell.
+- Stop BFB streaming when RShim does not report a populated `OPN_STR`; follow
+  the recovery runbook and use a platform reset instead of repeating
+  `bfb-install` attempts.
 
 ## NVIDIA References
 
@@ -78,6 +85,8 @@ nix run .#bluefield-build-bfb -- --help
 ```
 
 See [Install workflow](docs/install.md#build-a-bfb-installer) for the full flow.
+Use `bluefield-install-bfb` instead of raw `bfb-install` so protected RShim
+nodes, hung streams, and wedged RShim states are handled consistently.
 
 ## Credential Model
 

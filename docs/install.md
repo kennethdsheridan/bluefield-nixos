@@ -10,6 +10,7 @@ step as hardware-specific until you have verified console and BFB recovery.
 - A known-good vendor BFB recovery image for the target board and PSID.
 - Host-side tmfifo networking configured for the DPU peer address.
 - `nixos-anywhere`, `disko`, and Nix flakes available on the operator machine.
+- NVIDIA's `mlx-mkbfb`/`bfb-install` tooling when building or streaming BFBs.
 - Operator SSH keys supplied from a private wrapper flake, not this repository.
 
 The modules default to the common RShim tmfifo link:
@@ -124,8 +125,17 @@ Inspect and boot only after confirming the target device and recovery path:
 
 ```bash
 nix shell nixpkgs#bfscripts -c mlx-mkbfb -d /tmp/nixos-bluefield-installer.bfb
-sudo bfb-install --rshim rshim0 --bfb /tmp/nixos-bluefield-installer.bfb
+nix run .#bluefield-install-bfb -- \
+  --rshim rshim0 \
+  --bfb /tmp/nixos-bluefield-installer.bfb
 ```
+
+`bluefield-install-bfb` wraps `bfb-install` with local RShim preflight checks,
+sudo self-healing, bounded timeout handling, and process-group cleanup. It refuses
+to stream when `/dev/rshim0/misc` does not report a populated `OPN_STR`, which
+indicates the DPU Arm side is not responding cleanly through RShim. Follow
+[Wedged RShim Recovery](recovery.md#wedged-rshim-recovery) instead of retrying
+the same BFB.
 
 NVIDIA's [BF-Bundle Installation and Upgrade](https://docs.nvidia.com/doca/archive/3-5-0/bf-bundle-installation-and-upgrade)
 documents `bfb-install`, tmfifo defaults, DOCA installer behavior, and custom BFB

@@ -17,6 +17,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::os::raw::c_int;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -30,6 +31,7 @@ const SIGTERM: c_int = 15;
 const SIGKILL: c_int = 9;
 
 extern "C" {
+    fn geteuid() -> u32;
     fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
@@ -118,6 +120,7 @@ fn print_help() {
     println!("  --keep-log               Preserve bfb-install log output");
     println!("  --verbose                Enable verbose bfb-install output");
     println!("  --timeout-seconds <n>    Stop bfb-install if it hangs (default: 900)");
+    println!("  --allow-wedged-rshim     Stream even if RShim lacks a populated OPN_STR");
     println!("  --dry-run                Print the install command without streaming the BFB");
     println!();
     println!("repair-host-tmfifo options:");
@@ -298,6 +301,7 @@ struct InstallBfbArgs {
     keep_log: bool,
     verbose: bool,
     timeout_seconds: u64,
+    allow_wedged_rshim: bool,
     dry_run: bool,
 }
 
@@ -311,6 +315,7 @@ impl InstallBfbArgs {
         let mut keep_log = false;
         let mut verbose = false;
         let mut timeout_seconds = 900;
+        let mut allow_wedged_rshim = false;
         let mut dry_run = false;
         let mut iter = args.into_iter();
 
@@ -329,6 +334,7 @@ impl InstallBfbArgs {
                         .parse()
                         .map_err(|error| format!("invalid --timeout-seconds value: {error}"))?
                 }
+                "--allow-wedged-rshim" => allow_wedged_rshim = true,
                 "--dry-run" => dry_run = true,
                 "--help" | "-h" => return Err(install_bfb_usage()),
                 _ => {
@@ -348,6 +354,7 @@ impl InstallBfbArgs {
             keep_log,
             verbose,
             timeout_seconds,
+            allow_wedged_rshim,
             dry_run,
         })
     }
@@ -364,7 +371,7 @@ fn required_install_option_value(
 
 /// Returns the one-line `install-bfb` usage string used in parse errors and help output.
 fn install_bfb_usage() -> String {
-    "usage: bluefield-validate install-bfb --bfb <path> [--rshim <device>] [--bfb-install <path>] [--sudo <path>] [--keep-log] [--verbose] [--timeout-seconds <n>] [--dry-run]".to_string()
+    "usage: bluefield-validate install-bfb --bfb <path> [--rshim <device>] [--bfb-install <path>] [--sudo <path>] [--keep-log] [--verbose] [--timeout-seconds <n>] [--allow-wedged-rshim] [--dry-run]".to_string()
 }
 
 /// Installs a BFB over RShim, re-executing through sudo if local RShim nodes are protected.
@@ -394,7 +401,13 @@ fn install_bfb(args: InstallBfbArgs, raw_args: Vec<String>) -> Result<(), String
         ));
     }
 
-    if !rshim_accessible(&misc, &boot) {
+    if !rshim_status_readable(&misc) {
+        return sudo_reexec_install_bfb(&args, &raw_args, &rshim_dir);
+    }
+
+    check_rshim_ready_for_bfb(&misc, args.allow_wedged_rshim)?;
+
+    if !rshim_boot_writable_by_current_user(&boot) {
         return sudo_reexec_install_bfb(&args, &raw_args, &rshim_dir);
     }
 
@@ -439,9 +452,44 @@ fn rshim_argument(rshim: &str) -> Result<String, String> {
     }
 }
 
-/// Checks whether the current process can read RShim status and open the boot node for writing.
-fn rshim_accessible(misc: &Path, boot: &Path) -> bool {
-    File::open(misc).is_ok() && fs::OpenOptions::new().write(true).open(boot).is_ok()
+/// Checks whether RShim status can be read without touching the boot stream node.
+fn rshim_status_readable(misc: &Path) -> bool {
+    File::open(misc).is_ok()
+}
+
+/// Checks boot-node ownership without opening it, because opening it can affect RShim state.
+fn rshim_boot_writable_by_current_user(boot: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(boot) else {
+        return false;
+    };
+    let mode = metadata.mode();
+    let euid = unsafe { geteuid() };
+    euid == 0 || (metadata.uid() == euid && mode & 0o200 != 0) || mode & 0o002 != 0
+}
+
+/// Refuses BFB streaming when RShim exposes the observed wedged-device signature.
+fn check_rshim_ready_for_bfb(misc: &Path, allow_wedged_rshim: bool) -> Result<(), String> {
+    let status = fs::read_to_string(misc).map_err(|error| {
+        format!(
+            "failed to read RShim status from {}: {error}",
+            misc.display()
+        )
+    })?;
+    if !allow_wedged_rshim && !rshim_status_has_populated_opn(&status) {
+        return Err(format!(
+            "RShim status does not report a populated OPN_STR in {}; stop BFB streaming and follow docs/recovery.md#wedged-rshim-recovery, or pass --allow-wedged-rshim if you intentionally want to override this guard",
+            misc.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Detects a healthy OPN string before allowing a BFB stream to touch the boot node.
+fn rshim_status_has_populated_opn(status: &str) -> bool {
+    status.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        matches!(parts.next(), Some("OPN_STR")) && !matches!(parts.next(), None | Some("N/A"))
+    })
 }
 
 /// Re-executes this helper through sudo instead of relying on bfb-install's internal sudo lookup.
@@ -625,6 +673,24 @@ mod tests {
     fn process_exists(pid: c_int) -> bool {
         let result = unsafe { kill(pid, 0) };
         result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(3)
+    }
+
+    #[test]
+    fn rejects_missing_rshim_opn() {
+        let status = "DISPLAY_LEVEL   0\nOPN_STR         N/A\nFORCE_CMD       0\n";
+        assert!(!rshim_status_has_populated_opn(status));
+    }
+
+    #[test]
+    fn accepts_populated_rshim_opn() {
+        let status = "DISPLAY_LEVEL   0\nOPN_STR         MBF2H332A-AEEOT\nFORCE_CMD       0\n";
+        assert!(rshim_status_has_populated_opn(status));
+    }
+
+    #[test]
+    fn rejects_missing_rshim_opn_line() {
+        let status = "DISPLAY_LEVEL   0\nFORCE_CMD       0\n";
+        assert!(!rshim_status_has_populated_opn(status));
     }
 }
 
