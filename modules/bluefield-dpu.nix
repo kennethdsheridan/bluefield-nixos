@@ -10,6 +10,7 @@ in
 {
   imports = [
     (modulesPath + "/installer/scan/not-detected.nix")
+    ./bluefield-control-plane.nix
     ./bluefield-credentials.nix
     ./bluefield-network.nix
   ];

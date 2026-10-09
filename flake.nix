@@ -38,6 +38,7 @@
       };
 
       nixosModules = {
+        bluefield-control-plane = ./modules/bluefield-control-plane.nix;
         bluefield-credentials = ./modules/bluefield-credentials.nix;
         bluefield-network = ./modules/bluefield-network.nix;
         bluefield-dpu = ./modules/bluefield-dpu.nix;
@@ -142,6 +143,61 @@
               }
             ];
           };
+          controlPlaneSystem = lib.nixosSystem {
+            system = "aarch64-linux";
+            modules = [
+              self.nixosModules.bluefield-dpu
+              {
+                system.stateVersion = "25.11";
+                fileSystems."/" = {
+                  device = "/dev/disk/by-label/nixos";
+                  fsType = "ext4";
+                };
+                fileSystems."/boot/efi" = {
+                  device = "/dev/disk/by-label/ESP";
+                  fsType = "vfat";
+                };
+                bluefield.credentials.rootAuthorizedKeys = [ dummyKey ];
+                bluefield.controlPlane = {
+                  enable = true;
+                  routing = {
+                    enable = true;
+                    routes = [
+                      {
+                        destination = "10.42.0.0/16";
+                        gateway = "192.0.2.1";
+                      }
+                    ];
+                  };
+                  bgp = {
+                    enable = true;
+                    localAs = 64512;
+                    routerId = "192.0.2.2";
+                    neighbors = [
+                      {
+                        address = "192.0.2.1";
+                        remoteAs = 64513;
+                      }
+                    ];
+                    networks = [ "10.42.0.0/16" ];
+                  };
+                  evpn = {
+                    enable = true;
+                    vnis = [ 10042 ];
+                  };
+                  vpcs.test = {
+                    vni = 10042;
+                    cidrs = [ "10.42.0.0/16" ];
+                    bridge = "br-test";
+                  };
+                  doca = {
+                    enable = true;
+                    services.test.settings.mode = "report-only";
+                  };
+                };
+              }
+            ];
+          };
           # The tests exercise the tarball and BFB flows without requiring a
           # real BlueField carrier image or NVIDIA tooling during flake checks.
           fakeKexecTree = pkgs.runCommand "fake-bluefield-kexec-tree" { } ''
@@ -192,6 +248,15 @@
             cat > "$out" <<'EOF'
             ${builtins.unsafeDiscardStringContext dpuSystem.config.system.build.toplevel.drvPath}
             ${builtins.unsafeDiscardStringContext kexecSystem.config.system.build.toplevel.drvPath}
+            EOF
+          '';
+
+          bluefield-control-plane-eval = pkgs.runCommand "bluefield-control-plane-eval" { } ''
+            # Force evaluation of enabled control-plane intent, generated JSON,
+            # and the report-only reconciliation service.
+            cat > "$out" <<'EOF'
+            ${builtins.unsafeDiscardStringContext controlPlaneSystem.config.environment.etc."bluefield/control-plane.json".source}
+            ${builtins.unsafeDiscardStringContext controlPlaneSystem.config.systemd.services.bluefield-control-plane-reconcile.script}
             EOF
           '';
 

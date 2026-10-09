@@ -25,6 +25,7 @@ Validated lab result:
 ## Outputs
 
 - `nixosModules.bluefield-credentials`
+- `nixosModules.bluefield-control-plane`
 - `nixosModules.bluefield-network`
 - `nixosModules.bluefield-dpu`
 - `nixosModules.bluefield-kexec-installer`
